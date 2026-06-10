@@ -14,7 +14,7 @@ export class StubEmbedProvider implements EmbedProvider {
     this.#dimensions = dimensions;
   }
 
-  async embed(input: string): Promise<readonly number[]> {
+  async embed(input: string): Promise<number[]> {
     const vector = Array.from({ length: this.#dimensions }, () => 0);
 
     for (const token of tokenize(input)) {

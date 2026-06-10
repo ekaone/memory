@@ -1,62 +1,37 @@
-import { MEMORY_SCOPES, MemoryValidationError, type MemoryEntry, type MemoryScope, type RecallOpts } from "../types.js";
+import {
+  MEMORY_SCOPES,
+  MemoryValidationError,
+  type MemoryScope,
+  type NewMemoryEntry,
+  type RecallQuery,
+} from "../types.js";
 
-export function validateEntry(entry: MemoryEntry): void {
-  assertNonEmptyString(entry.id, "id");
-  assertNonEmptyString(entry.agentId, "agentId");
+export function validateNewEntry(entry: NewMemoryEntry): void {
+  if (typeof entry.content !== "string" || entry.content.length === 0) {
+    throw new MemoryValidationError("content must be a non-empty string.");
+  }
 
-  if (!isMemoryScope(entry.scope)) {
+  if (entry.scope !== undefined && !isMemoryScope(entry.scope)) {
+    throw new MemoryValidationError(`scope must be one of: ${MEMORY_SCOPES.join(", ")}.`);
+  }
+}
+
+export function validateRecallQuery(query: RecallQuery): void {
+  if (query.scope !== undefined && !isMemoryScope(query.scope)) {
     throw new MemoryValidationError(`scope must be one of: ${MEMORY_SCOPES.join(", ")}.`);
   }
 
-  if (typeof entry.content !== "string") {
-    throw new MemoryValidationError("content must be a string.");
-  }
-
-  if (!Number.isFinite(entry.createdAt)) {
-    throw new MemoryValidationError("createdAt must be a finite timestamp.");
-  }
-}
-
-export function validateRecall(query: string, opts: RecallOpts): void {
-  if (typeof query !== "string") {
-    throw new MemoryValidationError("query must be a string.");
-  }
-
-  if (opts.scope !== undefined && !isMemoryScope(opts.scope)) {
-    throw new MemoryValidationError(`scope must be one of: ${MEMORY_SCOPES.join(", ")}.`);
-  }
-
-  if (opts.since !== undefined && !Number.isFinite(opts.since)) {
-    throw new MemoryValidationError("since must be a finite timestamp.");
-  }
-
-  if (opts.threshold !== undefined && !Number.isFinite(opts.threshold)) {
-    throw new MemoryValidationError("threshold must be finite.");
-  }
-
-  if (opts.limit !== undefined && (!Number.isInteger(opts.limit) || opts.limit < 0)) {
-    throw new MemoryValidationError("limit must be a non-negative integer.");
-  }
-}
-
-export function normalizeLimit(limit: number | undefined, fallback: number): number {
-  if (limit === undefined) {
-    return fallback;
-  }
-
-  if (!Number.isInteger(limit) || limit < 0) {
+  if (query.limit !== undefined && (!Number.isInteger(query.limit) || query.limit < 0)) {
     throw new MemoryValidationError("limit must be a non-negative integer.");
   }
 
-  return limit;
-}
-
-export function cloneEntry(entry: MemoryEntry): MemoryEntry {
-  if (entry.metadata === undefined) {
-    return { ...entry };
+  if (query.since !== undefined && Number.isNaN(Date.parse(query.since))) {
+    throw new MemoryValidationError("since must be a valid ISO 8601 string.");
   }
 
-  return { ...entry, metadata: { ...entry.metadata } };
+  if (query.until !== undefined && Number.isNaN(Date.parse(query.until))) {
+    throw new MemoryValidationError("until must be a valid ISO 8601 string.");
+  }
 }
 
 export function assertNonEmptyString(value: string, label: string): void {

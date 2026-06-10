@@ -1,3 +1,5 @@
+export type EmbedFn = (text: string) => Promise<number[]>;
+
 export type EmbedProvider = {
-  embed(input: string): Promise<readonly number[]>;
+  embed: EmbedFn;
 };

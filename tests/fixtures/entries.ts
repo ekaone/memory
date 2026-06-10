@@ -1,18 +1,27 @@
-import type { MemoryEntry, MemoryScope } from "../../src/index.js";
+import type { MemoryEntry, MemoryScope, NewMemoryEntry } from "../../src/index.js";
 
-export const baseTimestamp = 1_775_000_000_000;
+export const baseTimestamp = "2025-01-01T00:00:00.000Z";
+export const laterTimestamp = "2025-01-01T00:01:00.000Z";
 
-export function entry(
+export function newEntry(
+  overrides: Partial<NewMemoryEntry> & Pick<NewMemoryEntry, "content">,
+): NewMemoryEntry {
+  return {
+    scope: "working",
+    ...overrides,
+  };
+}
+
+export function fullEntry(
   overrides: Partial<MemoryEntry> & Pick<MemoryEntry, "id" | "content">,
 ): MemoryEntry {
   return {
-    agentId: "agent-a",
     scope: "working",
     createdAt: baseTimestamp,
     ...overrides,
   };
 }
 
-export function scopedEntry(scope: MemoryScope, id: string, content: string): MemoryEntry {
-  return entry({ id, scope, content });
+export function scopedFullEntry(scope: MemoryScope, id: string, content: string): MemoryEntry {
+  return fullEntry({ id, scope, content });
 }

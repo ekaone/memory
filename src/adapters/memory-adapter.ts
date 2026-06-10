@@ -1,86 +1,91 @@
-import type { MemoryEntry, RecallOpts } from "../types.js";
+import type { MemoryEntry, RecallQuery, RecentOptions, SearchOptions } from "../types.js";
 import type { MemoryAdapter } from "./types.js";
 
-export class InMemoryAdapter implements MemoryAdapter {
-  readonly #entries = new Map<string, MemoryEntry>();
+const DEFAULT_SCOPE = "working" as const;
 
-  async write(entry: MemoryEntry): Promise<void> {
-    if (entry.scope !== "working") {
-      return;
-    }
+export function memoryAdapter(): MemoryAdapter {
+  const store = new Map<string, MemoryEntry>();
 
-    this.#entries.set(entry.id, cloneEntry(entry));
-  }
+  return {
+    async write(entry: MemoryEntry): Promise<MemoryEntry> {
+      const stored = clone({ ...entry, scope: entry.scope ?? DEFAULT_SCOPE });
+      store.set(entry.id, stored);
+      return clone(stored);
+    },
 
-  async recall(query: string, opts: RecallOpts = {}): Promise<MemoryEntry[]> {
-    if (opts.scope !== undefined && opts.scope !== "working") {
-      return [];
-    }
+    async recall(query: RecallQuery = {}): Promise<MemoryEntry[]> {
+      return [...store.values()]
+        .filter((e) => matchesQuery(e, query))
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+        .slice(0, query.limit)
+        .map(clone);
+    },
 
-    const scored: ScoredEntry[] = [];
+    async search(text: string, options: SearchOptions = {}): Promise<MemoryEntry[]> {
+      if (text.trim().length === 0) return [];
 
-    for (const entry of this.#entries.values()) {
-      if (opts.since !== undefined && entry.createdAt < opts.since) {
-        continue;
+      const scored: { entry: MemoryEntry; score: number }[] = [];
+
+      for (const entry of store.values()) {
+        if (options.agentId !== undefined && entry.agentId !== options.agentId) continue;
+        if (options.scope !== undefined && entry.scope !== options.scope) continue;
+
+        const score = lexicalScore(text, entry.content);
+        if (score > 0) scored.push({ entry, score });
       }
 
-      const score = lexicalScore(query, entry.content);
-      if (query.trim().length === 0 || score > 0) {
-        scored.push({ entry, score });
-      }
-    }
+      return scored
+        .sort((a, b) => b.score - a.score)
+        .slice(0, options.limit)
+        .map(({ entry }) => clone(entry));
+    },
 
-    return scored
-      .sort(compareScoredEntries)
-      .slice(0, opts.limit)
-      .map(({ entry }) => cloneEntry(entry));
-  }
+    async recent(options: RecentOptions = {}): Promise<MemoryEntry[]> {
+      return [...store.values()]
+        .filter((e) => {
+          if (options.agentId !== undefined && e.agentId !== options.agentId) return false;
+          if (options.scope !== undefined && e.scope !== options.scope) return false;
+          return true;
+        })
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+        .slice(0, options.limit)
+        .map(clone);
+    },
 
-  async forget(id: string): Promise<void> {
-    this.#entries.delete(id);
-  }
+    async forget(id: string): Promise<void> {
+      store.delete(id);
+    },
+
+    async clear(): Promise<void> {
+      store.clear();
+    },
+  };
 }
 
-type ScoredEntry = {
-  entry: MemoryEntry;
-  score: number;
-};
+function matchesQuery(entry: MemoryEntry, query: RecallQuery): boolean {
+  if (query.agentId !== undefined && entry.agentId !== query.agentId) return false;
+  if (query.scope !== undefined && entry.scope !== query.scope) return false;
+  if (query.type !== undefined && entry.type !== query.type) return false;
+  if (query.since !== undefined && entry.createdAt < query.since) return false;
+  if (query.until !== undefined && entry.createdAt > query.until) return false;
+  return true;
+}
 
-function compareScoredEntries(left: ScoredEntry, right: ScoredEntry): number {
-  const scoreDifference = right.score - left.score;
-  if (scoreDifference !== 0) {
-    return scoreDifference;
-  }
-
-  return right.entry.createdAt - left.entry.createdAt;
+function clone(entry: MemoryEntry): MemoryEntry {
+  return entry.metadata === undefined ? { ...entry } : { ...entry, metadata: { ...entry.metadata } };
 }
 
 function lexicalScore(query: string, content: string): number {
-  const queryTokens = tokenize(query);
-  if (queryTokens.length === 0) {
-    return 0;
-  }
-
+  const tokens = tokenize(query);
+  if (tokens.length === 0) return 0;
   const contentTokens = new Set(tokenize(content));
   let matches = 0;
-
-  for (const token of queryTokens) {
-    if (contentTokens.has(token)) {
-      matches += 1;
-    }
+  for (const token of tokens) {
+    if (contentTokens.has(token)) matches++;
   }
-
-  return matches / queryTokens.length;
+  return matches / tokens.length;
 }
 
 function tokenize(input: string): string[] {
   return input.toLowerCase().match(/[a-z0-9]+/g) ?? [];
-}
-
-function cloneEntry(entry: MemoryEntry): MemoryEntry {
-  if (entry.metadata === undefined) {
-    return { ...entry };
-  }
-
-  return { ...entry, metadata: { ...entry.metadata } };
 }

@@ -1,216 +1,267 @@
-import type { MemoryEntry, RecallOpts } from "../types.js";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import type { MemoryEntry, MemoryScope, RecallQuery, RecentOptions, SearchOptions } from "../types.js";
 import type { MemoryAdapter } from "./types.js";
 
-type SQLiteStatement = {
-  run(...values: unknown[]): unknown;
-  all(...values: unknown[]): unknown[];
+const DEFAULT_PATH = ".memory/memory.db";
+const DEFAULT_SCOPE: MemoryScope = "episodic";
+
+type SqliteStatement = {
+  run(...params: unknown[]): unknown;
+  all(...params: unknown[]): unknown[];
 };
 
-type SQLiteDatabase = {
-  exec(sql: string): unknown;
-  prepare(sql: string): SQLiteStatement;
+type SqliteDatabase = {
+  exec(sql: string): void;
+  prepare(sql: string): SqliteStatement;
+  pragma(pragma: string, options?: { simple?: boolean }): unknown;
 };
 
-type BetterSqlite3Module = {
-  default: new (filename: string) => SQLiteDatabase;
+type BetterSqlite3Constructor = new (path: string) => SqliteDatabase;
+
+export type SqliteAdapterOptions = {
+  path?: string;
 };
 
-export type SQLiteAdapterOptions = {
-  database?: SQLiteDatabase;
-};
+export function sqliteAdapter(options: SqliteAdapterOptions = {}): MemoryAdapter {
+  const dbPath = options.path ?? DEFAULT_PATH;
+  let db: SqliteDatabase | undefined;
+  let ftsReady = false;
 
-export class SQLiteAdapter implements MemoryAdapter {
-  readonly #entries = new Map<string, MemoryEntry>();
-  readonly #database: SQLiteDatabase | undefined;
-
-  constructor(options: SQLiteAdapterOptions = {}) {
-    this.#database = options.database;
-    this.#database?.exec(`
-      create table if not exists memory_entries (
-        id text primary key,
-        agent_id text not null,
-        scope text not null,
-        content text not null,
-        metadata text,
-        created_at integer not null
-      );
-
-      create virtual table if not exists memory_entries_fts using fts5(id unindexed, content);
-    `);
-  }
-
-  static async open(filename = ":memory:"): Promise<SQLiteAdapter> {
-    const module = await importBetterSqlite3();
-    return new SQLiteAdapter({ database: new module.default(filename) });
-  }
-
-  async write(entry: MemoryEntry): Promise<void> {
-    if (entry.scope !== "episodic") {
-      return;
+  function getDb(): SqliteDatabase {
+    if (db === undefined) {
+      throw new Error("SQLite adapter not initialized — call init() first.");
     }
-
-    if (this.#database !== undefined) {
-      this.#database
-        .prepare(
-          `insert or replace into memory_entries (id, agent_id, scope, content, metadata, created_at)
-           values (?, ?, ?, ?, ?, ?)`,
-        )
-        .run(entry.id, entry.agentId, entry.scope, entry.content, stringifyMetadata(entry), entry.createdAt);
-      this.#database
-        .prepare("insert or replace into memory_entries_fts (id, content) values (?, ?)")
-        .run(entry.id, entry.content);
-      return;
-    }
-
-    this.#entries.set(entry.id, cloneEntry(entry));
+    return db;
   }
-
-  async recall(query: string, opts: RecallOpts = {}): Promise<MemoryEntry[]> {
-    if (opts.scope !== undefined && opts.scope !== "episodic") {
-      return [];
-    }
-
-    if (this.#database !== undefined) {
-      return this.#recallFromDatabase(query, opts);
-    }
-
-    const scored: ScoredEntry[] = [];
-
-    for (const entry of this.#entries.values()) {
-      if (opts.since !== undefined && entry.createdAt < opts.since) {
-        continue;
-      }
-
-      const score = lexicalScore(query, entry.content);
-      if (query.trim().length === 0 || score > 0) {
-        scored.push({ entry, score });
-      }
-    }
-
-    return scored
-      .sort(compareScoredEntries)
-      .slice(0, opts.limit)
-      .map(({ entry }) => cloneEntry(entry));
-  }
-
-  async forget(id: string): Promise<void> {
-    if (this.#database !== undefined) {
-      this.#database.prepare("delete from memory_entries where id = ?").run(id);
-      this.#database.prepare("delete from memory_entries_fts where id = ?").run(id);
-      return;
-    }
-
-    this.#entries.delete(id);
-  }
-
-  #recallFromDatabase(query: string, opts: RecallOpts): MemoryEntry[] {
-    const rows = this.#databaseRows(query, opts.since);
-
-    return rows
-      .map(rowToEntry)
-      .sort((left, right) => right.createdAt - left.createdAt)
-      .slice(0, opts.limit);
-  }
-
-  #databaseRows(query: string, since: number | undefined): unknown[] {
-    if (this.#database === undefined) {
-      return [];
-    }
-
-    if (query.trim().length === 0) {
-      return this.#database
-        .prepare(
-          `select id, agent_id, scope, content, metadata, created_at
-           from memory_entries
-           where (? is null or created_at >= ?)
-           order by created_at desc`,
-        )
-        .all(since ?? null, since ?? null);
-    }
-
-    return this.#database
-      .prepare(
-        `select e.id, e.agent_id, e.scope, e.content, e.metadata, e.created_at
-         from memory_entries e
-         join memory_entries_fts f on f.id = e.id
-         where memory_entries_fts match ?
-           and (? is null or e.created_at >= ?)
-         order by rank`,
-      )
-      .all(query, since ?? null, since ?? null);
-  }
-}
-
-type ScoredEntry = {
-  entry: MemoryEntry;
-  score: number;
-};
-
-function compareScoredEntries(left: ScoredEntry, right: ScoredEntry): number {
-  const scoreDifference = right.score - left.score;
-  if (scoreDifference !== 0) {
-    return scoreDifference;
-  }
-
-  return right.entry.createdAt - left.entry.createdAt;
-}
-
-function lexicalScore(query: string, content: string): number {
-  const queryTokens = tokenize(query);
-  if (queryTokens.length === 0) {
-    return 0;
-  }
-
-  const contentTokens = new Set(tokenize(content));
-  let matches = 0;
-
-  for (const token of queryTokens) {
-    if (contentTokens.has(token)) {
-      matches += 1;
-    }
-  }
-
-  return matches / queryTokens.length;
-}
-
-function tokenize(input: string): string[] {
-  return input.toLowerCase().match(/[a-z0-9]+/g) ?? [];
-}
-
-function stringifyMetadata(entry: MemoryEntry): string | null {
-  return entry.metadata === undefined ? null : JSON.stringify(entry.metadata);
-}
-
-function rowToEntry(row: unknown): MemoryEntry {
-  const value = row as Record<string, unknown>;
-  const metadataText = value["metadata"];
-  const metadata =
-    typeof metadataText === "string" && metadataText.length > 0
-      ? (JSON.parse(metadataText) as Record<string, unknown>)
-      : undefined;
 
   return {
-    id: String(value["id"]),
-    agentId: String(value["agent_id"]),
-    scope: "episodic",
-    content: String(value["content"]),
-    ...(metadata === undefined ? {} : { metadata }),
-    createdAt: Number(value["created_at"]),
+    async init(): Promise<void> {
+      if (dbPath !== ":memory:") {
+        mkdirSync(dirname(dbPath), { recursive: true });
+      }
+
+      const Sqlite = await importBetterSqlite3();
+      db = new Sqlite(dbPath);
+
+      db.pragma("journal_mode = WAL");
+      db.pragma("foreign_keys = ON");
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS memories (
+          id          TEXT PRIMARY KEY,
+          agent_id    TEXT,
+          scope       TEXT,
+          type        TEXT,
+          content     TEXT NOT NULL,
+          metadata    TEXT,
+          created_at  TEXT NOT NULL,
+          updated_at  TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_memories_agent_id   ON memories(agent_id);
+        CREATE INDEX IF NOT EXISTS idx_memories_scope       ON memories(scope);
+        CREATE INDEX IF NOT EXISTS idx_memories_type        ON memories(type);
+        CREATE INDEX IF NOT EXISTS idx_memories_created_at  ON memories(created_at);
+
+        CREATE TABLE IF NOT EXISTS embeddings (
+          memory_id   TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+          vector      TEXT NOT NULL
+        );
+      `);
+    },
+
+    async write(entry: MemoryEntry): Promise<MemoryEntry> {
+      const database = getDb();
+      const scope = entry.scope ?? DEFAULT_SCOPE;
+      const stored: MemoryEntry = { ...entry, scope };
+
+      database.prepare(`
+        INSERT OR REPLACE INTO memories (id, agent_id, scope, type, content, metadata, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        stored.id,
+        stored.agentId ?? null,
+        stored.scope ?? null,
+        stored.type ?? null,
+        stored.content,
+        stored.metadata !== undefined ? JSON.stringify(stored.metadata) : null,
+        stored.createdAt,
+        stored.updatedAt ?? null,
+      );
+
+      if (stored.embedding !== undefined && stored.embedding.length > 0) {
+        database.prepare(
+          "INSERT OR REPLACE INTO embeddings (memory_id, vector) VALUES (?, ?)",
+        ).run(stored.id, JSON.stringify(stored.embedding));
+      }
+
+      if (ftsReady) {
+        database.prepare(
+          "INSERT OR REPLACE INTO memories_fts (id, content) VALUES (?, ?)",
+        ).run(stored.id, stored.content);
+      }
+
+      return stored;
+    },
+
+    async recall(query: RecallQuery = {}): Promise<MemoryEntry[]> {
+      const database = getDb();
+
+      const conditions: string[] = [];
+      const params: unknown[] = [];
+
+      if (query.agentId !== undefined) {
+        conditions.push("agent_id = ?");
+        params.push(query.agentId);
+      }
+
+      if (query.scope !== undefined) {
+        conditions.push("scope = ?");
+        params.push(query.scope);
+      }
+
+      if (query.type !== undefined) {
+        conditions.push("type = ?");
+        params.push(query.type);
+      }
+
+      if (query.since !== undefined) {
+        conditions.push("created_at >= ?");
+        params.push(query.since);
+      }
+
+      if (query.until !== undefined) {
+        conditions.push("created_at <= ?");
+        params.push(query.until);
+      }
+
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+      const limit = query.limit !== undefined ? `LIMIT ${query.limit}` : "";
+
+      const rows = database.prepare(`
+        SELECT id, agent_id, scope, type, content, metadata, created_at, updated_at
+        FROM memories
+        ${where}
+        ORDER BY created_at DESC
+        ${limit}
+      `).all(...params);
+
+      return rows.map(rowToEntry);
+    },
+
+    async search(text: string, options: SearchOptions = {}): Promise<MemoryEntry[]> {
+      const database = getDb();
+
+      if (text.trim().length === 0) return [];
+
+      if (!ftsReady) {
+        database.exec(
+          "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED, content)",
+        );
+        database.exec("INSERT INTO memories_fts (id, content) SELECT id, content FROM memories");
+        ftsReady = true;
+      }
+
+      const conditions: string[] = [];
+      const params: unknown[] = [text];
+
+      if (options.agentId !== undefined) {
+        conditions.push("m.agent_id = ?");
+        params.push(options.agentId);
+      }
+
+      if (options.scope !== undefined) {
+        conditions.push("m.scope = ?");
+        params.push(options.scope);
+      }
+
+      const and = conditions.length > 0 ? `AND ${conditions.join(" AND ")}` : "";
+      const limit = options.limit !== undefined ? `LIMIT ${options.limit}` : "";
+
+      const rows = database.prepare(`
+        SELECT m.id, m.agent_id, m.scope, m.type, m.content, m.metadata, m.created_at, m.updated_at
+        FROM memories m
+        JOIN memories_fts f ON f.id = m.id
+        WHERE memories_fts MATCH ?
+        ${and}
+        ORDER BY rank
+        ${limit}
+      `).all(...params);
+
+      return rows.map(rowToEntry);
+    },
+
+    async recent(options: RecentOptions = {}): Promise<MemoryEntry[]> {
+      const database = getDb();
+
+      const conditions: string[] = [];
+      const params: unknown[] = [];
+
+      if (options.agentId !== undefined) {
+        conditions.push("agent_id = ?");
+        params.push(options.agentId);
+      }
+
+      if (options.scope !== undefined) {
+        conditions.push("scope = ?");
+        params.push(options.scope);
+      }
+
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+      const limit = options.limit !== undefined ? `LIMIT ${options.limit}` : "";
+
+      const rows = database.prepare(`
+        SELECT id, agent_id, scope, type, content, metadata, created_at, updated_at
+        FROM memories
+        ${where}
+        ORDER BY created_at DESC
+        ${limit}
+      `).all(...params);
+
+      return rows.map(rowToEntry);
+    },
+
+    async forget(id: string): Promise<void> {
+      const database = getDb();
+      database.prepare("DELETE FROM memories WHERE id = ?").run(id);
+      if (ftsReady) {
+        database.prepare("DELETE FROM memories_fts WHERE id = ?").run(id);
+      }
+    },
+
+    async clear(): Promise<void> {
+      const database = getDb();
+      database.exec("DELETE FROM memories");
+      if (ftsReady) {
+        database.exec("DELETE FROM memories_fts");
+      }
+    },
   };
 }
 
-async function importBetterSqlite3(): Promise<BetterSqlite3Module> {
-  const importer = new Function("specifier", "return import(specifier)") as (
-    specifier: string,
-  ) => Promise<BetterSqlite3Module>;
+type DbRow = Record<string, unknown>;
 
-  return importer("better-sqlite3");
+function rowToEntry(row: unknown): MemoryEntry {
+  const r = row as DbRow;
+  const meta =
+    typeof r["metadata"] === "string" && r["metadata"].length > 0
+      ? (JSON.parse(r["metadata"]) as Record<string, unknown>)
+      : undefined;
+
+  return {
+    id: String(r["id"]),
+    ...(r["agent_id"] != null ? { agentId: String(r["agent_id"]) } : {}),
+    ...(r["scope"] != null ? { scope: r["scope"] as MemoryScope } : {}),
+    ...(r["type"] != null ? { type: String(r["type"]) } : {}),
+    content: String(r["content"]),
+    ...(meta !== undefined ? { metadata: meta } : {}),
+    createdAt: String(r["created_at"]),
+    ...(r["updated_at"] != null ? { updatedAt: String(r["updated_at"]) } : {}),
+  };
 }
 
-function cloneEntry(entry: MemoryEntry): MemoryEntry {
-  if (entry.metadata === undefined) {
-    return { ...entry };
-  }
-
-  return { ...entry, metadata: { ...entry.metadata } };
+async function importBetterSqlite3(): Promise<BetterSqlite3Constructor> {
+  const module = await import("better-sqlite3");
+  return module.default as unknown as BetterSqlite3Constructor;
 }

@@ -1,7 +1,11 @@
-import type { MemoryEntry, RecallOpts } from "../types.js";
+import type { MemoryEntry, RecallQuery, RecentOptions, SearchOptions } from "../types.js";
 
 export type MemoryAdapter = {
-  write(entry: MemoryEntry): Promise<void>;
-  recall(query: string, opts?: RecallOpts): Promise<MemoryEntry[]>;
+  init?(): Promise<void>;
+  write(entry: MemoryEntry): Promise<MemoryEntry>;
+  recall(query?: RecallQuery): Promise<MemoryEntry[]>;
+  search(text: string, options?: SearchOptions): Promise<MemoryEntry[]>;
+  recent(options?: RecentOptions): Promise<MemoryEntry[]>;
   forget(id: string): Promise<void>;
+  clear(): Promise<void>;
 };

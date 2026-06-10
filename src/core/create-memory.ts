@@ -1,32 +1,68 @@
-import { InMemoryAdapter } from "../adapters/memory-adapter.js";
 import type { MemoryAdapter } from "../adapters/types.js";
-import type { MemoryEntry, MemoryStore, RecallOpts } from "../types.js";
-import { assertNonEmptyString, cloneEntry, normalizeLimit, validateEntry, validateRecall } from "./validate-entry.js";
+import type {
+  MemoryEntry,
+  MemoryStore,
+  NewMemoryEntry,
+  RecallQuery,
+  RecentOptions,
+  SearchOptions,
+} from "../types.js";
+import { createMemoryId } from "../utils/id.js";
+import { nowIso } from "../utils/timestamp.js";
+import { assertNonEmptyString, validateNewEntry } from "./validate-entry.js";
 
-const DEFAULT_LIMIT = 10;
+export type MemoryConfig = {
+  adapter?: MemoryAdapter;
+};
 
-export function createMemory(adapter: MemoryAdapter = new InMemoryAdapter()): MemoryStore {
+export function createMemory(config?: MemoryConfig): MemoryStore {
+  const ready = resolveAdapter(config?.adapter);
+
   return {
-    async write(entry: MemoryEntry): Promise<void> {
-      validateEntry(entry);
-      await adapter.write(cloneEntry(entry));
+    async remember(entry: NewMemoryEntry): Promise<MemoryEntry> {
+      validateNewEntry(entry);
+      const adapter = await ready;
+      const now = nowIso();
+      const fullEntry: MemoryEntry = { ...entry, id: createMemoryId(), createdAt: now, updatedAt: now };
+      return adapter.write(fullEntry);
     },
 
-    async recall(query: string, opts: RecallOpts = {}): Promise<MemoryEntry[]> {
-      validateRecall(query, opts);
+    async recall(query?: RecallQuery): Promise<MemoryEntry[]> {
+      const adapter = await ready;
+      return adapter.recall(query);
+    },
 
-      const limit = normalizeLimit(opts.limit, DEFAULT_LIMIT);
-      if (limit === 0) {
-        return [];
-      }
+    async search(text: string, options?: SearchOptions): Promise<MemoryEntry[]> {
+      const adapter = await ready;
+      return adapter.search(text, options);
+    },
 
-      const entries = await adapter.recall(query, { ...opts, limit });
-      return entries.slice(0, limit).map((entry) => cloneEntry(entry));
+    async recent(options?: RecentOptions): Promise<MemoryEntry[]> {
+      const adapter = await ready;
+      return adapter.recent(options);
     },
 
     async forget(id: string): Promise<void> {
       assertNonEmptyString(id, "id");
-      await adapter.forget(id);
+      const adapter = await ready;
+      return adapter.forget(id);
+    },
+
+    async clear(): Promise<void> {
+      const adapter = await ready;
+      return adapter.clear();
     },
   };
+}
+
+async function resolveAdapter(adapter?: MemoryAdapter): Promise<MemoryAdapter> {
+  if (adapter !== undefined) {
+    await adapter.init?.();
+    return adapter;
+  }
+
+  const { sqliteAdapter } = await import("../adapters/sqlite-adapter.js");
+  const resolved = sqliteAdapter();
+  await resolved.init?.();
+  return resolved;
 }

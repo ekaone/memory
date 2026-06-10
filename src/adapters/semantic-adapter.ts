@@ -1,104 +1,105 @@
-import { StubEmbedProvider } from "../embed/stub-embed.js";
 import type { EmbedProvider } from "../embed/types.js";
-import { MemoryValidationError, type MemoryEntry, type RecallOpts } from "../types.js";
+import { MemoryValidationError, type MemoryEntry, type RecallQuery, type RecentOptions, type SearchOptions } from "../types.js";
 import { cosineSimilarity } from "../utils/cosine.js";
 import type { MemoryAdapter } from "./types.js";
 
-export class SemanticAdapter implements MemoryAdapter {
-  readonly #entries = new Map<string, MemoryEntry>();
-  readonly #vectors = new Map<string, readonly number[]>();
-  readonly #embedProvider: EmbedProvider;
+const DEFAULT_SCOPE = "semantic" as const;
 
-  constructor(embedProvider: EmbedProvider = new StubEmbedProvider()) {
-    this.#embedProvider = embedProvider;
-  }
-
-  async write(entry: MemoryEntry): Promise<void> {
-    if (entry.scope !== "semantic") {
-      return;
-    }
-
-    this.#entries.set(entry.id, cloneEntry(entry));
-    this.#vectors.set(entry.id, normalizeVector(await this.#embedProvider.embed(entry.content)));
-  }
-
-  async recall(query: string, opts: RecallOpts = {}): Promise<MemoryEntry[]> {
-    if (opts.scope !== undefined && opts.scope !== "semantic") {
-      return [];
-    }
-
-    if (query.trim().length === 0) {
-      return this.#allEntries(opts);
-    }
-
-    const queryVector = normalizeVector(await this.#embedProvider.embed(query));
-    const scored: ScoredEntry[] = [];
-
-    for (const entry of this.#entries.values()) {
-      if (opts.since !== undefined && entry.createdAt < opts.since) {
-        continue;
-      }
-
-      const vector = this.#vectors.get(entry.id);
-      const score = vector === undefined ? 0 : cosineSimilarity(queryVector, vector);
-      const threshold = opts.threshold ?? 0;
-      if (score > 0 && score >= threshold) {
-        scored.push({ entry, score });
-      }
-    }
-
-    return scored
-      .sort(compareScoredEntries)
-      .slice(0, opts.limit)
-      .map(({ entry }) => cloneEntry(entry));
-  }
-
-  async forget(id: string): Promise<void> {
-    this.#entries.delete(id);
-    this.#vectors.delete(id);
-  }
-
-  #allEntries(opts: RecallOpts): MemoryEntry[] {
-    return [...this.#entries.values()]
-      .filter((entry) => opts.since === undefined || entry.createdAt >= opts.since)
-      .sort((left, right) => right.createdAt - left.createdAt)
-      .slice(0, opts.limit)
-      .map((entry) => cloneEntry(entry));
-  }
-}
-
-type ScoredEntry = {
-  entry: MemoryEntry;
-  score: number;
+export type SemanticAdapterOptions = {
+  embed: EmbedProvider;
 };
 
-function compareScoredEntries(left: ScoredEntry, right: ScoredEntry): number {
-  const scoreDifference = right.score - left.score;
-  if (scoreDifference !== 0) {
-    return scoreDifference;
-  }
+export function semanticAdapter(options: SemanticAdapterOptions): MemoryAdapter {
+  const { embed: embedProvider } = options;
+  const store = new Map<string, MemoryEntry>();
+  const vectors = new Map<string, number[]>();
 
-  return right.entry.createdAt - left.entry.createdAt;
+  return {
+    async write(entry: MemoryEntry): Promise<MemoryEntry> {
+      const vec = normalizeVector(await embedProvider.embed(entry.content));
+      const stored = clone({ ...entry, scope: entry.scope ?? DEFAULT_SCOPE });
+      store.set(entry.id, stored);
+      vectors.set(entry.id, vec);
+      return clone(stored);
+    },
+
+    async recall(query: RecallQuery = {}): Promise<MemoryEntry[]> {
+      return [...store.values()]
+        .filter((e) => {
+          if (query.agentId !== undefined && e.agentId !== query.agentId) return false;
+          if (query.scope !== undefined && e.scope !== query.scope) return false;
+          if (query.type !== undefined && e.type !== query.type) return false;
+          if (query.since !== undefined && e.createdAt < query.since) return false;
+          if (query.until !== undefined && e.createdAt > query.until) return false;
+          return true;
+        })
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+        .slice(0, query.limit)
+        .map(clone);
+    },
+
+    async search(text: string, options: SearchOptions = {}): Promise<MemoryEntry[]> {
+      if (text.trim().length === 0) return [];
+
+      const queryVec = normalizeVector(await embedProvider.embed(text));
+      const scored: { entry: MemoryEntry; score: number }[] = [];
+
+      for (const entry of store.values()) {
+        if (options.agentId !== undefined && entry.agentId !== options.agentId) continue;
+        if (options.scope !== undefined && entry.scope !== options.scope) continue;
+
+        const vec = vectors.get(entry.id);
+        if (vec === undefined) continue;
+
+        const score = cosineSimilarity(queryVec, vec);
+        const threshold = options.threshold ?? 0;
+        if (score > 0 && score >= threshold) {
+          scored.push({ entry, score });
+        }
+      }
+
+      return scored
+        .sort((a, b) => b.score - a.score)
+        .slice(0, options.limit)
+        .map(({ entry }) => clone(entry));
+    },
+
+    async recent(options: RecentOptions = {}): Promise<MemoryEntry[]> {
+      return [...store.values()]
+        .filter((e) => {
+          if (options.agentId !== undefined && e.agentId !== options.agentId) return false;
+          if (options.scope !== undefined && e.scope !== options.scope) return false;
+          return true;
+        })
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+        .slice(0, options.limit)
+        .map(clone);
+    },
+
+    async forget(id: string): Promise<void> {
+      store.delete(id);
+      vectors.delete(id);
+    },
+
+    async clear(): Promise<void> {
+      store.clear();
+      vectors.clear();
+    },
+  };
 }
 
-function normalizeVector(vector: readonly number[]): readonly number[] {
-  if (vector.length === 0) {
+function normalizeVector(vec: number[]): number[] {
+  if (vec.length === 0) {
     throw new MemoryValidationError("embed provider returned an empty vector.");
   }
-
-  for (const value of vector) {
-    if (!Number.isFinite(value)) {
+  for (const v of vec) {
+    if (!Number.isFinite(v)) {
       throw new MemoryValidationError("embed provider returned a non-finite value.");
     }
   }
-
-  return [...vector];
+  return [...vec];
 }
 
-function cloneEntry(entry: MemoryEntry): MemoryEntry {
-  if (entry.metadata === undefined) {
-    return { ...entry };
-  }
-
-  return { ...entry, metadata: { ...entry.metadata } };
+function clone(entry: MemoryEntry): MemoryEntry {
+  return entry.metadata === undefined ? { ...entry } : { ...entry, metadata: { ...entry.metadata } };
 }

@@ -1,3 +1,3 @@
-export function timestamp(): number {
-  return Date.now();
+export function nowIso(): string {
+  return new Date().toISOString();
 }

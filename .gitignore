@@ -30,3 +30,6 @@ coverage/
 .env
 .env.local
 .env.*.local
+
+# Doc
+UPDATE-PLAN.md

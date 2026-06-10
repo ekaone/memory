@@ -2,28 +2,49 @@ export const MEMORY_SCOPES = ["working", "episodic", "semantic"] as const;
 
 export type MemoryScope = (typeof MEMORY_SCOPES)[number];
 
-export type MemoryMetadata = Record<string, unknown>;
-
 export type MemoryEntry = {
   id: string;
-  agentId: string;
-  scope: MemoryScope;
+  agentId?: string;
+  scope?: MemoryScope;
+  type?: string;
   content: string;
-  metadata?: MemoryMetadata;
-  createdAt: number;
+  metadata?: Record<string, unknown>;
+  embedding?: number[];
+  createdAt: string;
+  updatedAt?: string;
 };
 
-export type RecallOpts = {
+export type NewMemoryEntry = Omit<MemoryEntry, "id" | "createdAt" | "updatedAt">;
+
+export type RecallQuery = {
+  agentId?: string;
+  scope?: MemoryScope;
+  type?: string;
+  limit?: number;
+  since?: string;
+  until?: string;
+};
+
+export type SearchOptions = {
+  agentId?: string;
   scope?: MemoryScope;
   limit?: number;
-  since?: number;
   threshold?: number;
 };
 
+export type RecentOptions = {
+  agentId?: string;
+  scope?: MemoryScope;
+  limit?: number;
+};
+
 export type MemoryStore = {
-  write(entry: MemoryEntry): Promise<void>;
-  recall(query: string, opts?: RecallOpts): Promise<MemoryEntry[]>;
+  remember(entry: NewMemoryEntry): Promise<MemoryEntry>;
+  recall(query?: RecallQuery): Promise<MemoryEntry[]>;
+  search(text: string, options?: SearchOptions): Promise<MemoryEntry[]>;
+  recent(options?: RecentOptions): Promise<MemoryEntry[]>;
   forget(id: string): Promise<void>;
+  clear(): Promise<void>;
 };
 
 export class MemoryValidationError extends Error {
